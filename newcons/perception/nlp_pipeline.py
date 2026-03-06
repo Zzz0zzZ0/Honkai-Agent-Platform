@@ -11,7 +11,7 @@ class UserPerception(BaseModel):
     emotion: str = Field(description="用户情绪状态，必须是以下之一：positive, neutral, negative。如果是吐槽、抱怨，选择 negative。")
     entities: List[str] = Field(description="用户提到的核心实体，如角色名、游戏玩法等。")
     player_persona: List[str] = Field(description="根据用户发言推断的玩家画像标签，如 [强度党], [剧情党], [萌新], [零氪], [重氪] 等。")
-
+    game_entities: List[str] = Field(description="提取玩家发言中提到的游戏专有名词、角色名、物品名等实体（如：'黄泉', '混沌回忆', '星琼'）")
 def analyze_user_query(query: str, model_type="cloud", temp_val=0.1):
     """统一感知接口：一次性提取情感、实体与玩家画像"""
     try:
