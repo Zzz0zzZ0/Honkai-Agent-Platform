@@ -1,0 +1,24 @@
+# 1. 密钥与环境配置 (绝对不能泄露)
+.env
+*.env
+
+# 2. 数据库与动态生成文件
+chroma_db_data/
+community_feedback_log.csv
+
+# 3. Python 运行缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 4. 虚拟环境
+venv/
+env/
+.venv/
+rag_v2/
+
+# 5. IDE 与系统文件
+.vscode/
+.idea/
+.DS_Store
