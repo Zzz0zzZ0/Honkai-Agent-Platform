@@ -1,5 +1,5 @@
-import csv
 import os
+import sqlite3
 from datetime import datetime
 
 import pandas as pd
@@ -17,6 +17,27 @@ from algorithms.linucb import linucb_agent
 from algorithms.prf import algo_pseudo_relevance_feedback
 from algorithms.mmr import algo_mmr_rerank
 
+
+# ==========================================
+# 初始化 SQLite 数据库
+# ==========================================
+def _init_db():
+    conn = sqlite3.connect("community_feedback_log.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS feedback_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Timestamp TEXT,
+            Player_Query TEXT,
+            Emotion TEXT,
+            Player_Persona TEXT,
+            Status TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+_init_db()
 
 # ==========================================
 # 核心单步检索回路 (包含舆情落表)
@@ -41,32 +62,30 @@ def get_answer_complex(
     extracted_entities = []
     player_persona = []
 
+import concurrent.futures
+
+def log_negative_feedback_sync(question, emotion_label, persona_str):
+    try:
+        conn = sqlite3.connect("community_feedback_log.db", timeout=10)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO feedback_logs (Timestamp, Player_Query, Emotion, Player_Persona, Status) VALUES (?, ?, ?, ?, ?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), question, emotion_label, persona_str, "Pending_Review")
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"写入舆情数据库失败: {e}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
     # 0. NLP 结构化感知 (情绪、实体、玩家画像)
     if use_emotion or use_ner:
         emotion_label, extracted_entities, player_persona = analyze_user_query(
             question, model_type=model_type, temp_val=temp_param
         )
-
-        # 舆情自动化监控：连同玩家画像落表
-        if emotion_label == "negative":
-            log_file = "community_feedback_log.csv"
-            file_exists = os.path.isfile(log_file)
-            with open(log_file, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(
-                        ["Timestamp", "Player_Query", "Emotion", "Player_Persona", "Status"]
-                    )
-                persona_str = "|".join(player_persona) if player_persona else "未知"
-                writer.writerow(
-                    [
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        question,
-                        emotion_label,
-                        persona_str,
-                        "Pending_Review",
-                    ]
-                )
 
     # 1. 模型初始化
     if model_type == "local":
@@ -79,7 +98,9 @@ def get_answer_complex(
     arm_idx = -1
     context_vec = None
     if use_auto_alpha:
-        arm_idx, final_alpha, context_vec = linucb_agent.select_arm(question)
+        # 使用 Query 的 embedding 切片作为 LinUCB 特征
+        q_vec = embeddings.embed_query(question)
+        arm_idx, final_alpha, context_vec = linucb_agent.select_arm(q_vec)
 
     # 3. 混合检索 (增加空载保护)
     initial_docs = []
@@ -89,9 +110,12 @@ def get_answer_complex(
     if vectorstore is not None and bm25_retriever is not None:
         chroma_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
-        # 分别独立召回
-        docs_vs = chroma_retriever.invoke(question)
-        docs_bm25 = bm25_retriever.invoke(question)
+        # 分别独立召回 - 并发优化
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_vs = executor.submit(chroma_retriever.invoke, question)
+            future_bm25 = executor.submit(bm25_retriever.invoke, question)
+            docs_vs = future_vs.result()
+            docs_bm25 = future_bm25.result()
 
         # 根据 LinUCB 动态权重 (final_alpha) 精准分配配额
         k_vs = max(1, int(15 * final_alpha))
@@ -111,13 +135,7 @@ def get_answer_complex(
             pass
     unique_docs = list({doc.page_content: doc for doc in initial_docs}.values())
 
-    # 5. LinUCB 奖励更新 (增加保护，避免没文档时去算相似度)
-    if use_auto_alpha and unique_docs: # 【修复点 3】
-        q_vec = embeddings.embed_query(question)
-        d_vec = embeddings.embed_query(unique_docs[0].page_content)
-        reward = cosine_similarity([q_vec], [d_vec])[0][0]
-        linucb_agent.update(arm_idx, context_vec, reward)
-
+    # 5. 用户显式奖励系统已剥离，不再计算 cosine similarity 作为自我奖励
     # 6. MMR 重排序
     final_docs = (
         algo_mmr_rerank(question, unique_docs, embeddings, k_param=k_param)
@@ -150,6 +168,8 @@ def get_answer_complex(
         "emotion": emotion_label,
         "entities": extracted_entities,
         "persona": player_persona,
+        "arm_idx": arm_idx,
+        "context_vec": context_vec,
     }
 
 

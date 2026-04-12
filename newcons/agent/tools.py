@@ -25,20 +25,32 @@ def star_rail_gacha_calculator(current_pity: int, target_copies: int) -> str:
 @tool
 def analyze_community_feedback() -> str:
     """当运营人员要求总结今天的社区舆情、玩家负面反馈时调用此工具"""
-    log_file = "community_feedback_log.csv"
-    if not os.path.exists(log_file):
+    import sqlite3
+    db_file = "community_feedback_log.db"
+    if not os.path.exists(db_file):
         return "【舆情大盘】当前数据库为空。"
     try:
-        df = pd.read_csv(log_file)
-        neg_df = df[df["Emotion"] == "negative"]
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM feedback_logs")
+        total_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM feedback_logs WHERE Emotion = 'negative'")
+        neg_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT Player_Query, Player_Persona FROM feedback_logs WHERE Emotion = 'negative' ORDER BY id DESC LIMIT 3")
+        recent_rows = cursor.fetchall()
+        
         recent_complaints = "\n".join(
             [
-                f"- {row['Player_Query']} (画像: {row.get('Player_Persona', '未知')})"
-                for _, row in neg_df.tail(3).iterrows()
+                f"- {row[0]} (画像: {row[1]})"
+                for row in recent_rows
             ]
         )
+        conn.close()
         return (
-            f"【舆情大盘分析】目前共收录 {len(df)} 条反馈，高危负面 {len(neg_df)} 条。\n"
+            f"【舆情大盘分析】目前共收录 {total_count} 条反馈，高危负面 {neg_count} 条。\n"
             f"近期核心槽点：\n{recent_complaints}"
         )
     except Exception as e:

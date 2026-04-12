@@ -4,7 +4,9 @@
 
 # 2. 数据库与动态生成文件
 chroma_db_data/
-community_feedback_log.csv
+*.db
+*.sqlite3
+*.csv
 
 # 3. Python 运行缓存
 __pycache__/

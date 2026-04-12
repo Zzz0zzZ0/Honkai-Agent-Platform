@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import tempfile
 import os
@@ -9,8 +10,9 @@ import threading  # 添加线程锁
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.vector_store import build_hybrid_knowledge_base, visualize_semantic_space
-from engine.rag_pipeline import get_answer_complex
+from engine.rag_pipeline import get_answer_complex, log_negative_feedback_sync
 from agent.graph_brain import build_graph_agent
+from langchain_community.retrievers import BM25Retriever
 
 
 app = FastAPI(title="Cognitive Agent API", description="游戏智能运营大盘后台引擎")
@@ -19,6 +21,7 @@ app = FastAPI(title="Cognitive Agent API", description="游戏智能运营大盘
 global_memory = {
     "vectorstore": None,
     "bm25": None,
+    "all_splits": [],
 }
 memory_lock = threading.Lock()
 
@@ -37,6 +40,11 @@ class ChatRequest(BaseModel):
     # [新增] 恢复调节参数
     k_param: int = 3
     temp_param: float = 0.1
+
+class FeedbackRequest(BaseModel):
+    arm_idx: int
+    context_vec: list
+    reward: float
 
 
 @app.post("/upload_memory")
@@ -69,12 +77,17 @@ async def upload_memory(file: UploadFile = File(...)):
             tmp_file.write(file_content)
             tmp_path = tmp_file.name
 
-        vs, bm25, count = build_hybrid_knowledge_base(tmp_path)
+        vs, new_splits, count = build_hybrid_knowledge_base(tmp_path)
         
         # 使用线程锁保护全局状态更新
         with memory_lock:
             global_memory["vectorstore"] = vs
-            global_memory["bm25"] = bm25
+            global_memory["all_splits"].extend(new_splits)
+            
+            if global_memory["all_splits"]:
+                global_bm25 = BM25Retriever.from_documents(global_memory["all_splits"])
+                global_bm25.k = 10
+                global_memory["bm25"] = global_bm25
 
         # 生成可视化 2D 坐标数据，并转换成 JSON 格式发给前端
         viz_df = visualize_semantic_space(vs)
@@ -93,7 +106,7 @@ async def upload_memory(file: UploadFile = File(...)):
 
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
+async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
     """处理所有的对话与 Agent 路由请求"""
 
     def clean_llm_output(raw_output):
@@ -134,7 +147,7 @@ async def chat_endpoint(req: ChatRequest):
                 temp_param=req.temp_param,
                 k_param=req.k_param,
             )
-            response = agent_app.invoke({"messages": [("user", req.query)]})
+            response = await run_in_threadpool(agent_app.invoke, {"messages": [("user", req.query)]})
 
             # 清洗 Agent 输出的乱码
             raw_content = response["messages"][-1].content
@@ -147,11 +160,14 @@ async def chat_endpoint(req: ChatRequest):
                     for tc in msg.tool_calls:
                         thoughts.append(f"🛠️ 调用工具: {tc['name']}")
 
-            # 2. 旁路提取玩家画像标签
+            # 2. 旁路提取玩家画像标签与 LinUCB 特征
             persona_tags = []
+            arm_idx = -1
+            context_vec = []
             if req.use_emotion:
                 try:
-                    temp_result = get_answer_complex(
+                    temp_result = await run_in_threadpool(
+                        get_answer_complex,
                         vectorstore,
                         bm25,
                         req.query,
@@ -163,10 +179,20 @@ async def chat_endpoint(req: ChatRequest):
                         temp_param=req.temp_param,
                     )
                     persona_tags = temp_result.get("persona", [])
+                    arm_idx = temp_result.get("arm_idx", -1)
+                    context_vec = temp_result.get("context_vec", [])
+                    if temp_result.get("emotion") == "negative":
+                       background_tasks.add_task(log_negative_feedback_sync, req.query, "negative", "|".join(persona_tags))
                 except Exception as e:
-                    print(f"旁路画像提取失败: {e}")
+                    print(f"旁路画像与权重特征提取失败: {e}")
 
-            return {"answer": answer, "thoughts": thoughts, "persona": persona_tags}
+            return {
+                "answer": answer,
+                "thoughts": thoughts,
+                "persona": persona_tags,
+                "arm_idx": arm_idx,
+                "context_vec": context_vec,
+            }
 
         else:
             # 使用线程锁保护全局状态读取
@@ -174,7 +200,8 @@ async def chat_endpoint(req: ChatRequest):
                 vectorstore = global_memory["vectorstore"]
                 bm25 = global_memory["bm25"]
                 
-            result = get_answer_complex(
+            result = await run_in_threadpool(
+                get_answer_complex,
                 vectorstore,
                 bm25,
                 req.query,
@@ -186,6 +213,10 @@ async def chat_endpoint(req: ChatRequest):
                 temp_param=req.temp_param,
             )
 
+            if result.get("emotion") == "negative":
+                 persona_tags = result.get("persona", [])
+                 background_tasks.add_task(log_negative_feedback_sync, req.query, "negative", "|".join(persona_tags))
+
             raw_ans = result["answer"]
             clean_ans = clean_llm_output(raw_ans)
 
@@ -193,8 +224,20 @@ async def chat_endpoint(req: ChatRequest):
                 "answer": clean_ans,
                 "thoughts": [],
                 "persona": result.get("persona", []),
+                "arm_idx": result.get("arm_idx", -1),
+                "context_vec": result.get("context_vec", []),
             }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/feedback")
+async def explicit_feedback(req: FeedbackRequest):
+    """接收前端传回的点赞或点踩，作为 LinUCB 的显式奖励"""
+    try:
+        from algorithms.linucb import linucb_agent
+        linucb_agent.update(req.arm_idx, req.context_vec, req.reward)
+        return {"status": "success", "message": "Feedback received and LinUCB updated."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -20,11 +20,7 @@ embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
 def build_hybrid_knowledge_base(file_path: str):
     """构建 Chroma + BM25 混合索引"""
     persist_dir = "./chroma_db_data"
-    if os.path.exists(persist_dir):
-        try:
-            shutil.rmtree(persist_dir)
-        except Exception:
-            pass
+    # 移除自动删除旧目录的代码，以允许增量叠加知识库
 
     if file_path.endswith('.pdf'): 
         loader = PyPDFLoader(file_path)
@@ -46,10 +42,8 @@ def build_hybrid_knowledge_base(file_path: str):
     splits = text_splitter.split_documents(docs)
 
     vectorstore = Chroma.from_documents(splits, embeddings, persist_directory=persist_dir)
-    bm25_retriever = BM25Retriever.from_documents(splits)
-    bm25_retriever.k = 10
-
-    return vectorstore, bm25_retriever, len(splits)
+    # 不再在此处创建局部的 BM25，而是返回 splits 供上层构建全局 BM25
+    return vectorstore, splits, len(splits)
 
 
 def visualize_semantic_space(vectorstore):
